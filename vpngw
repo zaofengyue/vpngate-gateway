@@ -34,9 +34,65 @@ def _write_json(path, data):
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 
+SERVICE = "vpngate-gateway"
+
+def _init_system():
+    """systemd（Debian/Ubuntu）/ openrc（Alpine）/ none"""
+    if shutil.which("systemctl") and os.path.isdir("/run/systemd/system"):
+        return "systemd"
+    if shutil.which("rc-service"):
+        return "openrc"
+    return "none"
+
+def _manager_pids():
+    """通过 /proc 查找 vpngate_manager.py 进程（无服务管理器时的兜底）"""
+    pids = []
+    try:
+        for d in os.listdir("/proc"):
+            if not d.isdigit() or int(d) == os.getpid():
+                continue
+            try:
+                with open(f"/proc/{d}/cmdline", "rb") as f:
+                    args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+            except OSError:
+                continue
+            # 解释器必须是 python，且有参数的文件名恰好是 vpngate_manager.py
+            # （避免把 vim/tail 等碰巧带这个文件名的进程误判成服务）
+            if (len(args) >= 2
+                    and os.path.basename(args[0]).startswith("python")
+                    and any(os.path.basename(a) == "vpngate_manager.py" for a in args[1:])):
+                pids.append(int(d))
+    except OSError:
+        pass
+    return pids
+
 def _service_running():
-    r = subprocess.run(["systemctl","is-active","vpngate-gateway"], capture_output=True, text=True)
-    return r.stdout.strip() == "active"
+    init = _init_system()
+    try:
+        if init == "systemd":
+            r = subprocess.run(["systemctl", "is-active", SERVICE], capture_output=True, text=True)
+            return r.stdout.strip() == "active"
+        if init == "openrc":
+            r = subprocess.run(["rc-service", SERVICE, "status"], capture_output=True, text=True)
+            return r.returncode == 0
+    except OSError:
+        pass
+    return bool(_manager_pids())
+
+def _service_ctl(action):
+    """start / stop / restart，返回 (ok, message)"""
+    init = _init_system()
+    if init == "systemd":
+        cmd = ["systemctl", action, SERVICE]
+    elif init == "openrc":
+        cmd = ["rc-service", SERVICE, action]
+    else:
+        return False, "未检测到 systemd 或 OpenRC，无法管理服务"
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stderr.strip() or r.stdout.strip())
 
 def _send_cmd(cmd, args=[], timeout=120):
     if not DATA_DIR.exists():
@@ -254,21 +310,26 @@ def cmd_service(args=None, pause=False):
             if pause: input("  按 Enter 继续...")
             return
 
-    action_name = {"restart":"重启","stop":"停止","start":"启动"}.get(action, action)
+    if action not in ("restart", "stop", "start"):
+        _print_result(False, f"不支持的操作: {action}（可用: restart / stop / start）")
+        if pause: input("  按 Enter 继续...")
+        return
+
+    action_name = {"restart":"重启","stop":"停止","start":"启动"}[action]
     print(f"\n  正在{action_name}服务...\n")
-    r = subprocess.run(["systemctl", action, "vpngate-gateway"], capture_output=True, text=True)
-    if r.returncode == 0:
+    ok, msg = _service_ctl(action)
+    if ok:
         time.sleep(2)
         _print_result(True, f"服务已{action_name}")
         print(f"  当前状态: {green('运行中') if _service_running() else red('已停止')}\n")
     else:
-        _print_result(False, r.stderr.strip() or "操作失败")
+        _print_result(False, msg or "操作失败")
     if pause: input("  按 Enter 继续...")
 
 def _reinstall():
     print("\n  正在重装（保留依赖和数据）...\n")
     # 停止服务
-    subprocess.run(["systemctl","stop","vpngate-gateway"], capture_output=True)
+    _service_ctl("stop")
     # 重新下载核心文件
     files = ["vpn_utils.py","proxy_server.py","vpngate_manager.py","vpngw"]
     ok_all = True
@@ -287,12 +348,12 @@ def _reinstall():
         subprocess.run(["chmod","+x",str(INSTALL_DIR/"vpngw")], capture_output=True)
         subprocess.run(["ln","-sf",str(INSTALL_DIR/"vpngw"),"/usr/local/bin/vpngw"], capture_output=True)
         subprocess.run(["ln","-sf",str(INSTALL_DIR/"vpngw"),"/usr/local/bin/vg"], capture_output=True)
-        subprocess.run(["systemctl","start","vpngate-gateway"], capture_output=True)
+        _service_ctl("start")
         time.sleep(2)
         _print_result(True, f"重装完成，服务{'已启动' if _service_running() else '启动失败'}")
     else:
         _print_result(False, "部分文件下载失败，请检查网络")
-        subprocess.run(["systemctl","start","vpngate-gateway"], capture_output=True)
+        _service_ctl("start")
 
 # ── 卸载 ──────────────────────────────────────────────────────────────────────
 def cmd_uninstall(args=None, pause=False):
@@ -310,19 +371,28 @@ def cmd_uninstall(args=None, pause=False):
     if input(f"\n  确认{'卸载服务' if choice=='1' else '彻底卸载'}？[y/N] ").strip().lower() != "y":
         print("  已取消"); return
 
-    subprocess.run(["systemctl","stop","vpngate-gateway"], capture_output=True)
-    subprocess.run(["systemctl","disable","vpngate-gateway"], capture_output=True)
-    subprocess.run(["pkill","-f","openvpn.*vpngate-gateway"], capture_output=True)
+    init = _init_system()
+    _service_ctl("stop")
+    if init == "systemd":
+        subprocess.run(["systemctl","disable",SERVICE], capture_output=True)
+    elif init == "openrc":
+        subprocess.run(["rc-update","del",SERVICE,"default"], capture_output=True)
+    if shutil.which("pkill"):
+        subprocess.run(["pkill","-f","openvpn.*vpngate-gateway"], capture_output=True)
 
     import shutil as _sh
     for f in ["/etc/systemd/system/vpngate-gateway.service",
-              "/lib/systemd/system/vpngate-gateway.service"]:
+              "/lib/systemd/system/vpngate-gateway.service",
+              "/etc/init.d/vpngate-gateway",
+              "/var/log/vpngate-gateway.err",
+              "/etc/sysctl.d/99-vpngate-rpfilter.conf"]:
         try: os.unlink(f)
-        except: pass
-    subprocess.run(["systemctl","daemon-reload"], capture_output=True)
+        except OSError: pass
+    if init == "systemd":
+        subprocess.run(["systemctl","daemon-reload"], capture_output=True)
     for f in ["/usr/local/bin/vpngw","/usr/local/bin/vg"]:
         try: os.unlink(f)
-        except: pass
+        except OSError: pass
     try:
         _sh.rmtree(str(INSTALL_DIR))
         print(green("  ✔ 安装目录已删除"))
@@ -330,9 +400,17 @@ def cmd_uninstall(args=None, pause=False):
         print(red(f"  ✘ 删除安装目录失败: {e}"))
 
     if choice == "2":
-        r = subprocess.run(["apt-get","remove","-y","--auto-remove","openvpn","iproute2","net-tools"],
-                           capture_output=True, text=True)
-        print(green("  ✔ 依赖已卸载") if r.returncode==0 else yellow("  ⚠ 依赖卸载部分失败"))
+        if shutil.which("apt-get"):
+            pkg_cmd = ["apt-get","remove","-y","--auto-remove","openvpn","iproute2","net-tools"]
+        elif shutil.which("apk"):
+            pkg_cmd = ["apk","del","openvpn","iproute2"]
+        else:
+            pkg_cmd = None
+        if pkg_cmd:
+            r = subprocess.run(pkg_cmd, capture_output=True, text=True)
+            print(green("  ✔ 依赖已卸载") if r.returncode==0 else yellow("  ⚠ 依赖卸载部分失败"))
+        else:
+            print(yellow("  ⚠ 未识别包管理器，请手动卸载 openvpn"))
 
     print(green("\n  ✔ 卸载完成\n"))
 
@@ -403,13 +481,13 @@ def cmd_set(args=None, pause=False):
     defaults[key] = new_val
     _write_json(SETTINGS_FILE, defaults)
     print(green(f"\n  ✔ {name} 已设置为: {new_val}"))
-    print(dim("  部分设置需重启服务生效: systemctl restart vpngate-gateway\n"))
+    print(dim("  部分设置需重启服务生效: vg restart\n"))
     if pause: input("  按 Enter 继续...")
 
 # ── 交互菜单 ──────────────────────────────────────────────────────────────────
 def cmd_menu(_args=None):
     while True:
-        os.system("clear")
+        print("\033[H\033[2J", end="", flush=True)
         state   = _read_json(STATE_FILE, {})
         running = _service_running()
         active  = state.get("active_node_id", "")

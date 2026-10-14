@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -122,21 +123,46 @@ def log(msg: str) -> None:
 
 # ── 策略路由 ──────────────────────────────────────────────────────────────────
 def _run(*args: str) -> int:
-    return subprocess.run(list(args), capture_output=True).returncode
+    """执行外部命令，命令不存在（如精简系统缺少 ip/pkill）时返回 127 而不是崩溃"""
+    try:
+        return subprocess.run(list(args), capture_output=True).returncode
+    except OSError:
+        return 127
+
+_ovpn_version_cache: tuple[int, int] | None = None
+
+def _openvpn_version() -> tuple[int, int]:
+    """返回 OpenVPN (major, minor)，解析失败按 2.4 处理"""
+    global _ovpn_version_cache
+    if _ovpn_version_cache is not None:
+        return _ovpn_version_cache
+    ver = (2, 4)
+    try:
+        r = subprocess.run(["openvpn", "--version"], capture_output=True, text=True, timeout=5)
+        m = re.search(r"OpenVPN\s+(\d+)\.(\d+)", (r.stdout or "") + (r.stderr or ""))
+        if m:
+            ver = (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+    _ovpn_version_cache = ver
+    return ver
 
 def _setup_routing() -> None:
     log(f"[路由] 等待 {TUN_DEV} 就绪...")
     for _ in range(30):
-        if subprocess.run(["ip", "link", "show", TUN_DEV], capture_output=True).returncode == 0:
+        if _run("ip", "link", "show", TUN_DEV) == 0:
             break
         time.sleep(1)
     else:
         log(f"[路由] 警告：{TUN_DEV} 30秒内未就绪")
         return
     _cleanup_routing()
-    _run("ip", "route", "add", "default", "dev", TUN_DEV, "table", str(ROUTE_TABLE))
-    _run("ip", "rule", "add", "oif", TUN_DEV, "table", str(ROUTE_TABLE), "priority", "100")
-    log(f"[路由] 策略路由已配置：oif={TUN_DEV} → table {ROUTE_TABLE}")
+    rc_route = _run("ip", "route", "add", "default", "dev", TUN_DEV, "table", str(ROUTE_TABLE))
+    rc_rule  = _run("ip", "rule", "add", "oif", TUN_DEV, "table", str(ROUTE_TABLE), "priority", "100")
+    if rc_route == 0 and rc_rule == 0:
+        log(f"[路由] 策略路由已配置：oif={TUN_DEV} → table {ROUTE_TABLE}")
+    else:
+        log(f"[路由] 警告：策略路由配置失败（route={rc_route}, rule={rc_rule}），请确认已安装 iproute2（Alpine: apk add iproute2）")
 
 def _cleanup_routing() -> None:
     _run("ip", "rule", "del", "table", str(ROUTE_TABLE))
@@ -157,7 +183,7 @@ def _stop_openvpn() -> None:
             except subprocess.TimeoutExpired:
                 _active_process.kill()
         _active_process = None
-    subprocess.run(["pkill", "-f", r"openvpn.*vpngate-gateway"], capture_output=True)
+    _run("pkill", "-f", r"openvpn.*vpngate-gateway")
     _active_node_id = ""
 
 def _launch_openvpn(node: dict) -> tuple[bool, str]:
@@ -184,6 +210,12 @@ def _launch_openvpn(node: dict) -> tuple[bool, str]:
         "--pull-filter", "ignore", "ifconfig-ipv6",
         "--verb", "3",
     ]
+    # VPNGate 节点多为 AES-128-CBC；OpenVPN 2.6（如 Alpine）默认密码列表更严格，显式声明以保证兼容
+    ciphers = "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
+    if _openvpn_version() >= (2, 5):
+        cmd += ["--data-ciphers", ciphers]
+    else:
+        cmd += ["--ncp-ciphers", ciphers]
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
