@@ -58,7 +58,7 @@ declare -A EXPECTED_SHA256=(
     [vpn_utils.py]="05defaa2f28e52a41cdd7089f3e5c65faefbf0712e66c7e5b1f4b02f1bf6e442"
     [proxy_server.py]="afd66c295d34a7e76ce11d3c29a879e7f8226d5f0dbee83306e4eeea2ca9c9bd"
     [vpngate_manager.py]="4af977189d288917328401e30c8992ab8dc85600ea7cb7346995732cb6a8ae91"
-    [vpngw]="0be3dd2e85d5c8da08936187209d348a75676f807db9b798cdcd596b41ed5ec9"
+    [vpngw]="ac39ac41589e583f7f3cb5e191e8d6318678d2133956568d9854c43991770162"
 )
 # <<< SHA256SUMS <<<
 
