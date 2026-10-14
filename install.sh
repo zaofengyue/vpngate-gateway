@@ -64,8 +64,20 @@ ln -sf "$INSTALL_DIR/vpngw" /usr/local/bin/vpngw
 ln -sf "$INSTALL_DIR/vpngw" /usr/local/bin/vg
 chmod +x /usr/local/bin/vpngw /usr/local/bin/vg
 
-# ── 步骤 4：systemd 服务 ──────────────────────────────────────────────────────
-echo -e "${Y}[4/5] 配置 systemd 服务...${NC}"
+# ── 步骤 4：网络策略调整 ──────────────────────────────────────────────────────
+echo -e "${Y}[4/6] 调整内核网络参数（放宽反向路径过滤）...${NC}"
+# 部分云平台（如 GCP）默认开启严格反向路径过滤（rp_filter=1），
+# 会导致策略路由下 VPN 隧道的非对称回程流量被内核直接丢弃，
+# 造成 VPN 握手成功但实际无法出网。此处放宽为 loose 模式（2）以兼容。
+cat > /etc/sysctl.d/99-vpngate-rpfilter.conf << 'RPEOF'
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+RPEOF
+sysctl -p /etc/sysctl.d/99-vpngate-rpfilter.conf >/dev/null 2>&1 || true
+echo "    rp_filter 已设置为宽松模式（兼容 GCP/AWS 等云平台的策略路由）"
+
+# ── 步骤 5：systemd 服务 ──────────────────────────────────────────────────────
+echo -e "${Y}[5/6] 配置 systemd 服务...${NC}"
 
 cat > /etc/systemd/system/vpngate-gateway.service << EOF
 [Unit]
@@ -104,8 +116,8 @@ systemctl daemon-reload
 systemctl enable vpngate-gateway --quiet
 echo "    服务已注册: vpngate-gateway"
 
-# ── 步骤 5：初始化设置 ────────────────────────────────────────────────────────
-echo -e "${Y}[5/5] 初始化配置...${NC}"
+# ── 步骤 6：初始化设置 ────────────────────────────────────────────────────────
+echo -e "${Y}[6/6] 初始化配置...${NC}"
 
 # 先停止旧服务
 systemctl stop vpngate-gateway 2>/dev/null || true
