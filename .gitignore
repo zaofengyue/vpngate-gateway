@@ -1,0 +1,24 @@
+# 字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 运行时数据与日志
+data/
+*.log
+*.log.*
+*.err
+
+# 临时文件
+*.tmp
+.swp
+*~
+
+# 本地测试与补丁文件（不纳入轻量化主分支）
+tests/
+tools/
+*.patch
+
+# 系统文件
+.DS_Store
+Thumbs.db

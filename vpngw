@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """vg / vpngw — VPNGate Gateway 命令行工具"""
 from __future__ import annotations
-import argparse, json, os, shutil, subprocess, sys, time
+import argparse, getpass, json, os, pwd, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 INSTALL_DIR   = Path("/opt/vpngate-gateway")
@@ -12,8 +12,14 @@ NODES_FILE    = DATA_DIR / "nodes.json"
 STATE_FILE    = DATA_DIR / "state.json"
 LOG_FILE      = DATA_DIR / "vpngate.log"
 SETTINGS_FILE = DATA_DIR / "settings.json"
-GITHUB_RAW    = "https://raw.githubusercontent.com/wanchangkongyi/vpngate-gateway/main"
-INSTALL_SH    = "https://raw.githubusercontent.com/wanchangkongyi/vpngate-gateway/main/install.sh"
+GITHUB_REPO   = "zaofengyue/vpngate-gateway"
+SERVICE_USER  = "vpngate"
+
+sys.path.insert(0, str(INSTALL_DIR))
+try:
+    import vpn_utils            # 出口检测/泄漏检测复用服务端同一份实现
+except Exception:               # 未安装或损坏时 status --check 退化为不可用
+    vpn_utils = None
 
 _tty = sys.stdout.isatty()
 def _c(code, t): return f"\033[{code}m{t}\033[0m" if _tty else t
@@ -28,10 +34,26 @@ def _read_json(path, default=None):
     try: return json.loads(path.read_text(encoding="utf-8"))
     except: return default
 
+def _service_ids():
+    """服务降权运行的用户（settings.run_as_user，默认 vpngate）的 uid/gid；不存在返回 None"""
+    name = (_read_json(SETTINGS_FILE, {}) or {}).get("run_as_user", SERVICE_USER) or SERVICE_USER
+    try:
+        pw = pwd.getpwnam(name)
+        return pw.pw_uid, pw.pw_gid
+    except KeyError:
+        return None
+
 def _write_json(path, data):
+    """原子写入；文件以 0600 创建（settings.json 里可能有代理口令），root 写入时把属主交给服务用户"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
+    if os.geteuid() == 0:
+        ids = _service_ids()
+        if ids:
+            os.chown(tmp, *ids)
     tmp.replace(path)
 
 SERVICE = "vpngate-gateway"
@@ -159,18 +181,24 @@ def cmd_status(args=None, pause=False):
     if check or pause:
         print()
         print(f"  检测出口 IP...", end="", flush=True)
-        ip = ""
-        for cmd in [
-            ["curl","-4","-s","--proxy",f"socks5h://127.0.0.1:{port}","https://api.ipify.org","--max-time","8"],
-            ["curl","-4","-s","--socks5-hostname",f"127.0.0.1:{port}","https://api.ipify.org","--max-time","8"],
-        ]:
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-                if r.returncode == 0 and r.stdout.strip():
-                    ip = r.stdout.strip(); break
-            except: continue
-        if ip: print(f"\r  出口 IP   {green(ip)}          ")
-        else:  print(f"\r  出口 IP   {red('检测失败')}            ")
+        ip = direct = ""
+        if vpn_utils:
+            ip = vpn_utils.check_proxy(port, str(s.get("proxy_user", "")),
+                                       str(s.get("proxy_pass", "")), 8)["ip"]
+            if ip:
+                direct = vpn_utils.direct_ip(6)
+        if ip:
+            print(f"\r  出口 IP   {green(ip)}          ")
+            if direct and direct == ip:
+                print(f"  {red('⚠ 出口 IP 与本机真实 IP 相同 —— 流量可能没有走 VPN，请立即检查！')}")
+            elif direct:
+                print(f"  真实 IP   {dim(direct)} {dim('（与出口不同，正常）')}")
+        else:
+            print(f"\r  出口 IP   {red('检测失败')}            ")
+        if s.get("proxy_user"):
+            print(f"  代理认证  {green('已启用')}")
+        else:
+            print(f"  代理认证  {yellow('未启用')} {dim('（同机所有用户都能使用此代理，建议 vg set proxy_user / proxy_pass）')}")
 
     print(bold("─" * 52))
     print()
@@ -223,7 +251,7 @@ def cmd_nodes(args=None, pause=False):
     for i, n in enumerate(nodes[:limit], 1):
         prefix  = green("▶ ") if n.get("active") else "  "
         lat     = n.get("latency_ms", 0)
-        lat_s   = (green if lat<80 else yellow if lat<200 else red)(f"{lat}ms")
+        lat_s   = (green if lat<80 else yellow if lat<200 else red)(f"{'~' if n.get('latency_est') else ''}{lat}ms")
         probe   = {"available":green("✔"),"unavailable":red("✘"),"not_checked":dim("?")}.get(n.get("probe_status","not_checked"),"?")
         country_name = n.get("country") or n.get("country_code","")
         if short:
@@ -327,40 +355,37 @@ def cmd_service(args=None, pause=False):
     if pause: input("  按 Enter 继续...")
 
 def _reinstall():
-    print("\n  正在重装（保留依赖和数据）...\n")
-    # 停止服务
-    _service_ctl("stop")
-    # 重新下载核心文件
-    files = ["vpn_utils.py","proxy_server.py","vpngate_manager.py","vpngw"]
-    ok_all = True
-    for f in files:
-        print(f"  下载 {f}...", end="", flush=True)
-        r = subprocess.run(
-            ["curl","-fsSL",f"{GITHUB_RAW}/{f}","-o",str(INSTALL_DIR/f)],
-            capture_output=True, text=True
-        )
+    """
+    更新程序文件（保留依赖和数据）。下载对应版本的 install.sh 并以 --files-only 运行：
+    安装器会按其内置的 SHA256 清单校验其余文件，校验不通过不会替换任何东西。
+    固定版本：VPNGATE_REF=<tag 或 commit> vg service
+    """
+    ref = os.environ.get("VPNGATE_REF", "main")
+    base = os.environ.get("VPNGATE_RAW_BASE") or f"https://raw.githubusercontent.com/{GITHUB_REPO}/{ref}"
+    url = f"{base}/install.sh"
+    print(f"\n  正在更新（版本: {ref}，保留依赖和数据）...\n")
+    tmpdir = tempfile.mkdtemp(prefix="vpngw-")
+    script = os.path.join(tmpdir, "install.sh")
+    try:
+        r = subprocess.run(["curl", "-fsSL", url, "-o", script], capture_output=True, text=True)
+        if r.returncode != 0:
+            _print_result(False, f"下载安装器失败: {r.stderr.strip() or r.returncode}")
+            return
+        r = subprocess.run(["bash", script, "--files-only"], env={**os.environ, "VPNGATE_REF": ref})
         if r.returncode == 0:
-            print(green(" ✔"))
+            time.sleep(2)
+            _print_result(True, f"更新完成，服务{'已运行' if _service_running() else '未运行'}")
         else:
-            print(red(" ✘"))
-            ok_all = False
-    if ok_all:
-        subprocess.run(["chmod","+x",str(INSTALL_DIR/"vpngw")], capture_output=True)
-        subprocess.run(["ln","-sf",str(INSTALL_DIR/"vpngw"),"/usr/local/bin/vpngw"], capture_output=True)
-        subprocess.run(["ln","-sf",str(INSTALL_DIR/"vpngw"),"/usr/local/bin/vg"], capture_output=True)
-        _service_ctl("start")
-        time.sleep(2)
-        _print_result(True, f"重装完成，服务{'已启动' if _service_running() else '启动失败'}")
-    else:
-        _print_result(False, "部分文件下载失败，请检查网络")
-        _service_ctl("start")
+            _print_result(False, "更新失败（哈希校验未通过或下载出错），已保留现有文件")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ── 卸载 ──────────────────────────────────────────────────────────────────────
 def cmd_uninstall(args=None, pause=False):
     print()
     print(bold("  卸载选项"))
     print("  1. 卸载服务")
-    print("  2. 彻底卸载")
+    print("  2. 彻底卸载（清理本服务并卸载 openvpn）")
     print("  0. 取消")
     print()
     choice = input("  选择: ").strip()
@@ -398,17 +423,26 @@ def cmd_uninstall(args=None, pause=False):
         print(green("  ✔ 安装目录已删除"))
     except Exception as e:
         print(red(f"  ✘ 删除安装目录失败: {e}"))
+    try:
+        pwd.getpwnam(SERVICE_USER)
+        if shutil.which("userdel"):
+            subprocess.run(["userdel", SERVICE_USER], capture_output=True)
+        elif shutil.which("deluser"):
+            subprocess.run(["deluser", SERVICE_USER], capture_output=True)
+        print(green(f"  ✔ 服务用户 {SERVICE_USER} 已删除"))
+    except KeyError:
+        pass
 
     if choice == "2":
         if shutil.which("apt-get"):
-            pkg_cmd = ["apt-get","remove","-y","--auto-remove","openvpn","iproute2","net-tools"]
+            pkg_cmd = ["apt-get", "remove", "-y", "openvpn"]
         elif shutil.which("apk"):
-            pkg_cmd = ["apk","del","openvpn","iproute2"]
+            pkg_cmd = ["apk", "del", "openvpn"]
         else:
             pkg_cmd = None
         if pkg_cmd:
             r = subprocess.run(pkg_cmd, capture_output=True, text=True)
-            print(green("  ✔ 依赖已卸载") if r.returncode==0 else yellow("  ⚠ 依赖卸载部分失败"))
+            print(green("  ✔ openvpn 依赖已卸载") if r.returncode == 0 else yellow("  ⚠ openvpn 卸载部分失败"))
         else:
             print(yellow("  ⚠ 未识别包管理器，请手动卸载 openvpn"))
 
@@ -426,14 +460,42 @@ SETTINGS_DEF = [
     ("auto_fetch_on_start",  "启动自动抓取",   "服务启动时自动抓取节点 true/false",          "bool"),
     ("outlet_check_interval", "出口检测间隔",   "秒，0=关闭出口连通性检测",                   "int"),
     ("outlet_max_fails",      "出口失败阈值",   "连续失败N次后标记节点不可用并轮换",           "int"),
+    ("dns_servers",          "隧道DNS",        "经VPN解析域名的DNS，逗号分隔，如 1.1.1.1,8.8.8.8（需重启）", "str"),
+    ("proxy_user",           "代理用户名",     "SOCKS5/HTTP 认证用户名，留空/off=不启用；须与密码同时设置（需重启）", "str"),
+    ("proxy_pass",           "代理密码",       "认证密码；用 vg set proxy_pass 回车后隐藏输入；off=清除（需重启）",  "secret"),
+    ("run_as_user",          "降权用户",       "服务降权运行的系统用户；留空或 root=不降权（需重启）",              "str"),
 ]
+
+_CRED_RE = re.compile(r"^[A-Za-z0-9._~!@#%^*+=\-]{1,128}$")
+_CLEAR = ("", "off", "none", "-")
+
+def _validate_setting(key, val):
+    """返回错误信息；合法返回 None"""
+    if key in ("proxy_user", "proxy_pass") and val != "" and not _CRED_RE.match(val):
+        return "只允许字母数字和 . _ ~ ! @ # % ^ * + = -，长度 1-128（不含冒号/空格/引号）"
+    if key == "proxy_port" and not (1 <= val <= 65535):
+        return "端口范围 1-65535"
+    if key == "dns_servers":
+        import socket as _s
+        items = [x.strip() for x in str(val).split(",") if x.strip()]
+        for x in items:
+            try: _s.inet_pton(_s.AF_INET, x)
+            except OSError: return f"不是合法的 IPv4 地址: {x}"
+        if not items: return "至少需要一个 DNS 服务器"
+    if key == "run_as_user" and val not in ("", "root"):
+        try: pwd.getpwnam(val)
+        except KeyError: return f"系统用户 {val} 不存在"
+    return None
 
 def cmd_set(args=None, pause=False):
     settings = _read_json(SETTINGS_FILE, {})
     defaults = {"country_filter":[],"rotate_hours":2,"latency_check_hours":1,"min_nodes":5,
                 "top_nodes":20,"probe_count":10,"proxy_port":7928,"auto_fetch_on_start":True,
-                "outlet_check_interval":60,"outlet_max_fails":3}
+                "outlet_check_interval":60,"outlet_max_fails":3,
+                "dns_servers":"1.1.1.1,8.8.8.8","proxy_user":"","proxy_pass":"",
+                "run_as_user":SERVICE_USER}
     defaults.update(settings)
+    show = lambda k: ("******" if defaults.get(k) else "") if k == "proxy_pass" else defaults.get(k, "")
 
     key   = getattr(args, "key", None) if args else None
     value = getattr(args, "value", None) if args else None
@@ -443,7 +505,7 @@ def cmd_set(args=None, pause=False):
         print(bold("  当前设置（输入序号修改）："))
         print()
         for i, (k, name, desc, typ) in enumerate(SETTINGS_DEF, 1):
-            print(f"  {cyan(str(i))}. {bold(name):<14} = {yellow(str(defaults.get(k,'')))}")
+            print(f"  {cyan(str(i))}. {bold(name):<14} = {yellow(str(show(k)))}")
             print(f"     {dim(desc)}")
             print()
         print(f"  {cyan('0')}. 返回")
@@ -453,8 +515,8 @@ def cmd_set(args=None, pause=False):
         if sel.isdigit() and 1 <= int(sel) <= len(SETTINGS_DEF):
             k, name, desc, typ = SETTINGS_DEF[int(sel)-1]
             key = k
-            print(f"\n  当前值: {yellow(str(defaults.get(k,'')))}  {dim(desc)}")
-            value = input(f"  新值: ").strip()
+            print(f"\n  当前值: {yellow(str(show(k)))}  {dim(desc)}")
+            value = (getpass.getpass("  新值（隐藏输入）: ") if typ == "secret" else input("  新值: ")).strip()
         else:
             print(red("  无效选择"))
             if pause: input("  按 Enter 继续...")
@@ -467,6 +529,13 @@ def cmd_set(args=None, pause=False):
         return
 
     _, name, _, typ = entry
+    if value is None:                      # vg set proxy_pass（不带值）：隐藏输入，口令不进 shell 历史和 ps
+        if typ != "secret":
+            print(red(f"\n  请提供新值: vg set {key} <值>\n"))
+            return
+        value = getpass.getpass("  新值（隐藏输入）: ").strip()
+    if typ in ("str", "secret") and key in ("proxy_user", "proxy_pass") and value.lower() in _CLEAR:
+        value = ""
     try:
         if   typ == "list":  new_val = [x.strip().upper() for x in value.split(",") if x.strip()] if value else []
         elif typ == "bool":  new_val = value.lower() in ("true","1","yes")
@@ -478,9 +547,16 @@ def cmd_set(args=None, pause=False):
         if pause: input("  按 Enter 继续...")
         return
 
+    err = _validate_setting(key, new_val)
+    if err:
+        print(red(f"\n  ✘ {err}\n"))
+        if pause: input("  按 Enter 继续...")
+        return
     defaults[key] = new_val
+    if bool(defaults.get("proxy_user")) != bool(defaults.get("proxy_pass")):
+        print(yellow("\n  ⚠ proxy_user 与 proxy_pass 需要同时设置，只设一个时服务会拒绝启动"))
     _write_json(SETTINGS_FILE, defaults)
-    print(green(f"\n  ✔ {name} 已设置为: {new_val}"))
+    print(green(f"\n  ✔ {name} 已设置为: {'******' if typ == 'secret' and new_val else new_val}"))
     print(dim("  部分设置需重启服务生效: vg restart\n"))
     if pause: input("  按 Enter 继续...")
 
@@ -593,7 +669,7 @@ def main():
     p = _add("rotate");        p.set_defaults(func=lambda a: cmd_rotate(a))
     p = _add("stop");          p.set_defaults(func=lambda a: cmd_stop(a))
     p = _add("logs");          p.add_argument("-n","--lines",type=int,default=50); p.set_defaults(func=lambda a: cmd_logs(a))
-    p = _add("set");           p.add_argument("key"); p.add_argument("value"); p.set_defaults(func=lambda a: cmd_set(a))
+    p = _add("set");           p.add_argument("key"); p.add_argument("value", nargs="?"); p.set_defaults(func=lambda a: cmd_set(a))
     p = _add("restart");       p.set_defaults(func=lambda a: cmd_service(type("A",(),{"action":"restart"})()))
     p = _add("service");       p.add_argument("action",nargs="?"); p.set_defaults(func=lambda a: cmd_service(a))
     p = _add("check-latency"); p.set_defaults(func=lambda a: cmd_check_latency(a))
